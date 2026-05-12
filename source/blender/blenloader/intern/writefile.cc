@@ -832,6 +832,11 @@ static uint64_t get_address_id_int(WriteData &wd, const void *address)
   if (address == nullptr) {
     return 0;
   }
+  if (wd.use_memfile) {
+    /* In undo case, use raw pointers directly to avoid the significant overhead of hash table
+     * operations in this very hot path. */
+    return uint64_t(address);
+  }
   /* Either reuse an existing identifier or create a new one. */
   /* NOTE: In undo case, the stable address data is re-used from the previously written undo step.
    * This means that the address may already be in the map.
@@ -879,6 +884,29 @@ static void writestruct_at_address_nr(WriteData *wd,
       CLOG_ERROR(&LOG, "Cannot write chunks bigger than INT_MAX.");
       return;
     }
+  }
+
+  /* In undo case, use raw pointers directly to avoid the significant overhead of stable-address
+   * translation. */
+  if (wd->use_memfile) {
+    BHead bh;
+    bh.code = filecode;
+    bh.old = adr;
+    bh.nr = nr;
+    bh.SDNAnr = struct_nr;
+    bh.len = len_in_bytes;
+
+    if (bh.len == 0) {
+      return;
+    }
+
+    if (wd->debug_dst) {
+      dna::print_structs_at_address(*wd->sdna, struct_nr, data, adr, nr, *wd->debug_dst);
+    }
+
+    write_bhead(wd, bh);
+    mywrite(wd, data, size_t(bh.len));
+    return;
   }
 
   /* Get the address identifier that will be written to the file.*/
@@ -987,6 +1015,26 @@ static void writedata(
     return;
   }
 
+  /* In undo case, use raw pointers directly to avoid the significant overhead of stable-address
+   * translation. */
+  if (wd->use_memfile) {
+    BHead bh;
+    bh.code = filecode;
+    bh.old = adr;
+    bh.nr = 1;
+    BLI_STATIC_ASSERT(SDNA_RAW_DATA_STRUCT_INDEX == 0, "'raw data' SDNA struct index should be 0")
+    bh.SDNAnr = SDNA_RAW_DATA_STRUCT_INDEX;
+    bh.len = int64_t(len);
+
+    if (wd->debug_dst) {
+      write_raw_data_in_debug_file(wd, len, adr, data);
+    }
+
+    write_bhead(wd, bh);
+    mywrite(wd, data, len);
+    return;
+  }
+
   const void *address_id = get_address_id(*wd, adr);
 
   BHead bh;
@@ -998,7 +1046,7 @@ static void writedata(
   bh.len = int64_t(len);
 
   if (wd->debug_dst) {
-    write_raw_data_in_debug_file(wd, len, address_id, adr);
+    write_raw_data_in_debug_file(wd, len, address_id, data);
   }
 
   write_bhead(wd, bh);
@@ -1701,6 +1749,13 @@ static Vector<ID *> gather_local_ids_to_write(Main *bmain, const bool is_undo)
  */
 static void prepare_stable_data_block_ids(WriteData &wd, Main &bmain)
 {
+  if (wd.use_memfile) {
+    /* In undo case, stable addresses are not needed. The memfile is self-consistent within a
+     * single session and using raw pointers avoids the significant overhead of hash table
+     * operations. */
+    return;
+  }
+
   ID *id;
   FOREACH_MAIN_ID_BEGIN (&bmain, id) {
     /* Ensure no other stable pointer has been created before. */
